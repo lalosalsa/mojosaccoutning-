@@ -83,6 +83,44 @@ const newBooks = (type) => ({
 const SESSION_KEY = "bb:session";
 const acctKey = (email) => `bb:acct:${email.toLowerCase().replace(/[^a-z0-9@.+_-]/g, "")}`;
 const booksKey = (bizId) => `bb:books:${bizId}`;
+const credKey = (email) => `bb:cred:${email.toLowerCase().replace(/[^a-z0-9@.+_-]/g, "")}`;
+
+/* ---------------- storage (localStorage, with host-storage fallback) ----------------
+   The app persists everything through this async key/value store. In a hosted
+   artifact environment `window.storage` is provided; on a normal web deploy it is
+   not, so we fall back to localStorage so books are still saved on the device. */
+const storage =
+  typeof window !== "undefined" && window.storage
+    ? window.storage
+    : {
+        get: async (k) => {
+          try {
+            const v = localStorage.getItem(k);
+            return v === null ? null : { value: v };
+          } catch {
+            return null;
+          }
+        },
+        set: async (k, v) => {
+          localStorage.setItem(k, v);
+        },
+        delete: async (k) => {
+          localStorage.removeItem(k);
+        },
+      };
+
+/* ---------------- password hashing (Web Crypto, SHA-256 + per-account salt) ---------------- */
+const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const randSalt = () => {
+  const a = new Uint8Array(16);
+  crypto.getRandomValues(a);
+  return b64(a.buffer);
+};
+const hashPw = async (pw, salt) => {
+  const data = new TextEncoder().encode(`${salt}:${pw}`);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return b64(digest);
+};
 
 /* ---------------- tiny UI atoms ---------------- */
 const Money = ({ v, size = 14, color, weight = 600 }) => (
@@ -191,7 +229,7 @@ export default function BeanCounter() {
   useEffect(() => {
     (async () => {
       try {
-        const r = await window.storage.get(SESSION_KEY);
+        const r = await storage.get(SESSION_KEY);
         setSession(r && r.value ? JSON.parse(r.value) : null);
       } catch { setSession(null); }
     })();
@@ -199,11 +237,11 @@ export default function BeanCounter() {
 
   const signIn = async (email) => {
     const s = { email: email.trim().toLowerCase() };
-    try { await window.storage.set(SESSION_KEY, JSON.stringify(s)); } catch {}
+    try { await storage.set(SESSION_KEY, JSON.stringify(s)); } catch {}
     setSession(s);
   };
   const signOut = async () => {
-    try { await window.storage.delete(SESSION_KEY); } catch {}
+    try { await storage.delete(SESSION_KEY); } catch {}
     setSession(null); setAcct(null); setBooks(null); setView("dashboard");
   };
 
@@ -213,14 +251,14 @@ export default function BeanCounter() {
     (async () => {
       let a = null;
       try {
-        const r = await window.storage.get(acctKey(session.email));
+        const r = await storage.get(acctKey(session.email));
         a = r && r.value ? JSON.parse(r.value) : null;
       } catch {}
       if (!a) a = { businesses: [], activeBizId: null };
       // one-time migration of pre-account books
       if (a.businesses.length === 0) {
         try {
-          const old = await window.storage.get("beanbooks:v1");
+          const old = await storage.get("beanbooks:v1");
           if (old && old.value) {
             const od = JSON.parse(old.value);
             const bizId = uid();
@@ -232,19 +270,19 @@ export default function BeanCounter() {
                   typeof n === "string" ? { id: uid(), name: n, address: "", city: "", phone: "", taxRate: "", manager: "" } : n),
               },
             };
-            await window.storage.set(booksKey(bizId), JSON.stringify(migrated));
+            await storage.set(booksKey(bizId), JSON.stringify(migrated));
             a = { businesses: [{ id: bizId, name: od.settings?.businessName || "My Business", type: "coffee", ein: "", entity: "LLC" }], activeBizId: bizId };
           }
         } catch {}
       }
       setAcct(a);
-      try { await window.storage.set(acctKey(session.email), JSON.stringify(a)); } catch {}
+      try { await storage.set(acctKey(session.email), JSON.stringify(a)); } catch {}
     })();
   }, [session]);
 
   const saveAcct = async (a) => {
     setAcct(a);
-    try { await window.storage.set(acctKey(session.email), JSON.stringify(a)); } catch {}
+    try { await storage.set(acctKey(session.email), JSON.stringify(a)); } catch {}
   };
 
   /* ---- books for active business ---- */
@@ -254,7 +292,7 @@ export default function BeanCounter() {
     if (!acct || !acct.activeBizId) return;
     (async () => {
       try {
-        const r = await window.storage.get(booksKey(acct.activeBizId));
+        const r = await storage.get(booksKey(acct.activeBizId));
         setBooks(r && r.value ? JSON.parse(r.value) : newBooks("general"));
       } catch { setBooks(newBooks("general")); }
       booksLoaded.current = true;
@@ -269,7 +307,7 @@ export default function BeanCounter() {
     const key = booksKey(acct.activeBizId);
     saveTimer.current = setTimeout(async () => {
       try {
-        await window.storage.set(key, JSON.stringify(books));
+        await storage.set(key, JSON.stringify(books));
         setSaveState("saved"); setTimeout(() => setSaveState("idle"), 1500);
       } catch { setSaveState("error"); }
     }, 600);
@@ -281,12 +319,12 @@ export default function BeanCounter() {
   /* ---- create business ---- */
   const createBusiness = async ({ name, type, entity, ein }) => {
     const biz = { id: uid(), name: name.trim(), type, entity, ein };
-    try { await window.storage.set(booksKey(biz.id), JSON.stringify(newBooks(type))); } catch {}
+    try { await storage.set(booksKey(biz.id), JSON.stringify(newBooks(type))); } catch {}
     await saveAcct({ businesses: [...(acct?.businesses || []), biz], activeBizId: biz.id });
     setView("settings");
   };
   const deleteBusiness = async (id) => {
-    try { await window.storage.delete(booksKey(id)); } catch {}
+    try { await storage.delete(booksKey(id)); } catch {}
     const rest = acct.businesses.filter((b) => b.id !== id);
     await saveAcct({ businesses: rest, activeBizId: rest[0]?.id || null });
     setView("dashboard");
@@ -458,7 +496,80 @@ const Center = ({ children }) => (
 /* ---------------- sign in ---------------- */
 function SignIn({ onSignIn }) {
   const [email, setEmail] = useState("");
-  const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [mode, setMode] = useState("unknown"); // unknown | login | create
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+
+  // Once a valid email is entered, look up whether an account already exists
+  // on this device so we can show "Sign in" vs. "Create account".
+  useEffect(() => {
+    let cancelled = false;
+    if (!emailValid) {
+      setMode("unknown");
+      return;
+    }
+    (async () => {
+      try {
+        const r = await storage.get(credKey(email));
+        if (!cancelled) setMode(r && r.value ? "login" : "create");
+      } catch {
+        if (!cancelled) setMode("create");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [email, emailValid]);
+
+  const creating = mode === "create";
+  const canSubmit =
+    emailValid && pw.length >= 6 && (!creating || pw2.length >= 6) && !busy;
+
+  const submit = async () => {
+    setErr("");
+    if (!emailValid) return setErr("Enter a valid email address.");
+    if (pw.length < 6) return setErr("Password must be at least 6 characters.");
+    setBusy(true);
+    try {
+      const r = await storage.get(credKey(email));
+      const existing = r && r.value ? JSON.parse(r.value) : null;
+      if (existing) {
+        const h = await hashPw(pw, existing.salt);
+        if (h !== existing.hash) {
+          setBusy(false);
+          return setErr("That password doesn't match this email.");
+        }
+      } else {
+        if (pw !== pw2) {
+          setBusy(false);
+          return setErr("Passwords don't match.");
+        }
+        const salt = randSalt();
+        const hash = await hashPw(pw, salt);
+        await storage.set(credKey(email), JSON.stringify({ salt, hash }));
+      }
+      await onSignIn(email);
+    } catch {
+      setBusy(false);
+      setErr("Couldn't sign in — please try again.");
+    }
+  };
+
+  const onKey = (e) => {
+    if (e.key === "Enter" && canSubmit) submit();
+  };
+
+  const btnLabel = busy
+    ? "Working…"
+    : creating
+    ? "Create account"
+    : mode === "login"
+    ? "Sign in"
+    : "Continue";
+
   return (
     <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: T.ink, fontFamily: "system-ui" }}>
       <div style={{ width: 380, background: T.paper, borderRadius: 16, padding: "36px 34px", boxShadow: "0 24px 60px rgba(0,0,0,.4)" }}>
@@ -466,18 +577,40 @@ function SignIn({ onSignIn }) {
         <div style={{ fontSize: 13, color: T.muted, textAlign: "center", marginTop: 6, marginBottom: 26 }}>
           Books for every business you run.
         </div>
-        <Field label="Email">
-          <Input placeholder="you@business.com" value={email} onChange={(e) => setEmail(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && valid && onSignIn(email)} />
-        </Field>
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <Field label="Email">
+            <Input type="email" autoComplete="email" placeholder="you@business.com" value={email}
+              onChange={(e) => setEmail(e.target.value)} onKeyDown={onKey} />
+          </Field>
+          <Field label="Password">
+            <Input type="password" autoComplete={creating ? "new-password" : "current-password"}
+              placeholder={creating ? "At least 6 characters" : "Your password"} value={pw}
+              onChange={(e) => setPw(e.target.value)} onKeyDown={onKey} />
+          </Field>
+          {creating && (
+            <Field label="Confirm password">
+              <Input type="password" autoComplete="new-password" placeholder="Re-enter password" value={pw2}
+                onChange={(e) => setPw2(e.target.value)} onKeyDown={onKey} />
+            </Field>
+          )}
+        </div>
+        {err && (
+          <div style={{ fontSize: 12.5, color: T.red, marginTop: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <AlertCircle size={14} /> {err}
+          </div>
+        )}
         <div style={{ marginTop: 16 }}>
-          <button onClick={() => valid && onSignIn(email)} style={{
-            width: "100%", background: valid ? T.amber : T.lineDark, color: "#fff", border: "none",
-            borderRadius: 9, padding: "11px 0", fontSize: 14.5, fontWeight: 700, cursor: valid ? "pointer" : "default",
-          }}>Continue</button>
+          <button onClick={() => canSubmit && submit()} disabled={!canSubmit} style={{
+            width: "100%", background: canSubmit ? T.amber : T.lineDark, color: "#fff", border: "none",
+            borderRadius: 9, padding: "11px 0", fontSize: 14.5, fontWeight: 700, cursor: canSubmit ? "pointer" : "default",
+          }}>{btnLabel}</button>
         </div>
         <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 14, lineHeight: 1.5 }}>
-          No password, no verification email — your address is just the key to your set of books on this device.
+          {creating
+            ? "New here — pick a password to create your account. It's stored only on this device."
+            : mode === "login"
+            ? "Welcome back. Enter your password to open your books."
+            : "Enter your email and password. Your books are saved on this device."}
         </div>
       </div>
     </div>
